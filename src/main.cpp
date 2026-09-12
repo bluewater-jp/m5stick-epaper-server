@@ -24,8 +24,9 @@ GxEPD2_4C<GxEPD2_154c_GDEM0154F51H, GxEPD2_154c_GDEM0154F51H::HEIGHT> display(
 
 WebServer server(80);
 
-// 受信用画像バッファ (200x200px, 1ピクセル=1バイト: 0=WHITE, 1=BLACK, 2=RED, 3=YELLOW)
+// グローバルバッファ (200x200 = 40,000バイト)
 uint8_t imageBuffer[200 * 200];
+size_t receivedBytes = 0;
 
 // --- WebUI (HTML + JavaScript) ---
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -62,12 +63,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         
         let convertedData = new Uint8Array(200 * 200);
 
-        // パレット定義 [R, G, B] -> EPD Color Index (0:WHITE, 1:BLACK, 2:RED, 3:YELLOW)
         const PALETTE = [
-            { c: 0, r: 255, g: 255, b: 255 }, // WHITE
-            { c: 1, r: 0,   g: 0,   b: 0   }, // BLACK
-            { c: 2, r: 255, g: 0,   b: 0   }, // RED
-            { c: 3, r: 255, g: 255, b: 0   }  // YELLOW
+            { c: 0, r: 255, g: 255, b: 255 },
+            { c: 1, r: 0,   g: 0,   b: 0   },
+            { c: 2, r: 255, g: 0,   b: 0   },
+            { c: 3, r: 255, g: 255, b: 0   }
         ];
 
         fileInput.addEventListener('change', (e) => {
@@ -84,7 +84,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 // 4色への減色処理 (最近傍色マッチング)
                 for (let i = 0; i < data.length; i += 4) {
                     const r = data[i], g = data[i+1], b = data[i+2];
-                    
                     let minDistance = Infinity;
                     let bestMatch = PALETTE[0];
 
@@ -107,23 +106,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
                 ctx.putImageData(imgData, 0, 0);
                 sendBtn.disabled = false;
-                status.innerText = "Image converted to 4-colors!";
+                status.innerText = "Ready to send!";
             };
             img.src = URL.createObjectURL(file);
         });
 
         function uploadImage() {
             sendBtn.disabled = true;
-            status.innerText = "Sending image to M5...";
+            status.innerText = "Sending image...";
+
+            // FormData 形式でバイナリ化して送信 (マルチパート通信)
+            const blob = new Blob([convertedData], { type: 'application/octet-stream' });
+            const formData = new FormData();
+            formData.append('img', blob, 'image.bin');
 
             fetch('/upload_img', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/octet-stream' },
-                body: convertedData
+                body: formData
             })
             .then(res => res.text())
             .then(text => {
-                status.innerText = "Updating E-Paper display...";
+                status.innerText = "Sent! Check M5 Display.";
             })
             .catch(err => {
                 status.innerText = "Error: " + err;
@@ -139,27 +142,48 @@ void handleRoot() {
     server.send(200, "text/html", INDEX_HTML);
 }
 
-// バイナリ画像データの受信処理
-void handleImageUpload() {
-    if (server.hasArg("plain") == false) {
-        // stream受信処理
-        HTTPUpload& upload = server.upload();
+// ストリーム型アップロードハンドラ (マルチパートデータ受信)
+void handleUploadUpload() {
+    HTTPUpload& upload = server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        receivedBytes = 0;
+        Serial.println("\n[Upload] Start receiving file...");
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(5, 5);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.print("Receiving...");
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (upload.buf != NULL && (receivedBytes + upload.currentSize <= sizeof(imageBuffer))) {
+            memcpy(imageBuffer + receivedBytes, upload.buf, upload.currentSize);
+            receivedBytes += upload.currentSize;
+
+            Serial.printf("[Upload] Recv: %d / 40000 bytes\n", receivedBytes);
+
+            M5.Display.fillRect(5, 25, 120, 20, BLACK);
+            M5.Display.setCursor(5, 25);
+            M5.Display.printf("%d B", receivedBytes);
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        Serial.printf("[Upload] Complete! Total: %d bytes\n", receivedBytes);
     }
-    
-    // リクエストボディからバイナリを取得
-    String body = server.arg("plain");
-    int len = server.arg("plain").length();
+}
 
-    if (len >= 200 * 200) {
-        memcpy(imageBuffer, server.arg("plain").c_str(), 200 * 200);
-        server.send(200, "text/plain", "OK");
+void handleUploadComplete() {
+    server.send(200, "text/plain", "OK");
 
-        // 本体液晶にステータス表示
+    if (receivedBytes >= 200 * 200) {
+        Serial.println("[EPD] Starting EPD Update...");
         M5.Display.fillScreen(BLACK);
         M5.Display.setTextColor(YELLOW);
-        M5.Display.drawString("Drawing Photo...", 5, 10);
+        M5.Display.setCursor(5, 5);
+        M5.Display.print("Drawing EPD...");
 
-        // 電子ペーパーへ描画
+        // SPI & 電子ペーパー初期化
+        SPI.begin(EPD_SCL, -1, EPD_SDA, EPD_CS);
+        display.init(115200, true, 2, false);
+        display.setRotation(2);
+
         display.firstPage();
         do {
             display.fillScreen(GxEPD_WHITE);
@@ -176,14 +200,17 @@ void handleImageUpload() {
                         display.drawPixel(x, y, epdColor);
                     }
                 }
+                if (y % 10 == 0) yield();
             }
         } while (display.nextPage());
 
+        Serial.println("[EPD] Update Finished!");
         M5.Display.fillScreen(BLACK);
         M5.Display.setTextColor(GREEN);
-        M5.Display.drawString("Photo Done!", 5, 10);
+        M5.Display.setCursor(5, 5);
+        M5.Display.print("Done!");
     } else {
-        server.send(400, "text/plain", "Invalid Data Size");
+        Serial.printf("[ERROR] Incomplete data: %d bytes received\n", receivedBytes);
     }
 }
 
@@ -191,9 +218,14 @@ void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
 
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n=== M5StickC Plus E-Paper Booting ===");
+
     M5.Display.setRotation(3);
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextSize(1);
+    
     // 1. SoftAP 開始
     WiFi.softAP(AP_SSID, AP_PASS);
     IPAddress IP = WiFi.softAPIP();
@@ -209,8 +241,9 @@ void setup() {
 
     // 3. ルーティング設定
     server.on("/", HTTP_GET, handleRoot);
-    server.on("/upload_img", HTTP_POST, handleImageUpload);
+    server.on("/upload_img", HTTP_POST, handleUploadComplete, handleUploadUpload);
     server.begin();
+    Serial.println("[OK] Web Server Started.");
 }
 
 void loop() {
